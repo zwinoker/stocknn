@@ -1,0 +1,1 @@
+mpirun -np 2 python ./ppt.py > output.txt

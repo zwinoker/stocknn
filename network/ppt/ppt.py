@@ -34,6 +34,7 @@ import json
 import os
 import time
 import random
+import math
 
 import xml.etree.ElementTree as ET
 
@@ -58,6 +59,8 @@ class PPTInstance() :
 
 		# Dataset for training
 		self.dataSet = SupervisedDataSet(10, 1)
+		self.dataSubset = SupervisedDataSet(10, 1)
+		self.numTrainingSamples = 0
 
 		# Local copy of network
 		self.network = None
@@ -68,7 +71,8 @@ class PPTInstance() :
 		# Record training errors here
 		self.errorFile = 'training-errors'
 		self.totalError = numpy.zeros(1)
-		self.thresholdError = 0.00001
+		self.thresholdError = 0.0000001
+		self.errors = []
 
 		# XML strings of all networks
 		self.nnStringArray = []
@@ -76,6 +80,9 @@ class PPTInstance() :
 		# Matrix of params of different NNs
 		self.paramMatrix = [[],[],[],[]]
 		self.avgParamsMatrix = [[],[],[],[]]
+
+		# Continue training?
+		self.keepTraining = True
 
 	# Initialize network
 	def initializeNN(self) :
@@ -108,16 +115,12 @@ class PPTInstance() :
 
 			self.nnFromXML()
 
-	# Create a pybrain dataset using a randomly subset of the symbols' data.
-	def generateDataSubset(self):
-		# Find subset of symbols that this node is responsible for.
-		numSyms = len(self.symlist) / numProc
-		# numSyms = 50
-		random.shuffle(self.symlist)
-		self.mySyms = self.symlist[0:numSyms]
 
+	# Create a pybrain dataset using a randomly subset of the symbols' data.
+	def loadData(self):
+		# Find subset of symbols that this node is responsible for.
 		# Add training data from each symbol
-		for symbol in self.mySyms :
+		for symbol in self.symlist :
 			symbol = "".join([symbol,"_"])
 			dataPath = os.path.join(self.dataFolderPath, symbol)
 
@@ -137,18 +140,31 @@ class PPTInstance() :
 				outputVector = outputData["return"]
 
 				self.dataSet.appendLinked(inputVector, outputVector)
+				self.numTrainingSamples += 1
 		# print self.dataSet.randomBatches("Input", 2)
+
+	# Creates data subset for training. Proportation is the fraction of the 
+	# 	data that this node is responsible for.
+	def subsetData(self, proportion) :
+		indicies = numpy.random.permutation(self.numTrainingSamples)
+		separator = int(self.numTrainingSamples * proportion)
+		myIndicies = indicies[:separator]
+		self.dataSubset = SupervisedDataSet(inp=self.dataSet['input'][myIndicies].copy(),
+                                   target=self.dataSet['target'][myIndicies].copy())
 
 	# Train network using local data and record error.
 	def trainOnLocal(self) :
 		# Train
-		self.trainer = BackpropTrainer(self.network, self.dataSet)
+		self.trainer = BackpropTrainer(self.network, self.dataSubset, learningrate=0.1)
 		error = numpy.zeros(1)
 		error[0] = self.trainer.train()
 		totalError = numpy.zeros(1)
+
 		comm.Allreduce(error, totalError, op=MPI.SUM)
+
 		totalError = totalError / float(numProc)
 		self.totalError = totalError
+		self.errors.insert(0,self.totalError)
 
 		# Record error
 		if rank == 0:
@@ -206,26 +222,49 @@ if __name__ == "__main__":
 
 	ppt = PPTInstance()
 	ppt.initializeNN()
-	ppt.generateDataSubset()
+
+	genstart = time.time()
+	ppt.loadData()
+	proportion = 1.0/float(numProc)
+	# proportion = 0.01
+
 	counter = 1
 
-	while True :
+	while ppt.keepTraining :
 		if rank == 0 :
 			print "Epoch number : ", counter, "\n"
 			counter += 1
+
 		ppt.broadcastMasterNN() 
+
+		substart = time.time()
+		ppt.subsetData(proportion)
 		ppt.trainOnLocal()
-		if (ppt.totalError <= ppt.thresholdError):
-			break
+
 		comm.Barrier()
+
+		# If we fail to improve the network by more than the threshold change, then stop training.
+		if counter >= 3 and (math.fabs(ppt.errors[1]-ppt.errors[0]) <= ppt.thresholdError):
+			if rank == 0 :
+				ppt.keepTraining = False
+
+		ppt.keepTraining = comm.bcast(ppt.keepTraining, root=0)
+
+		if not ppt.keepTraining:
+			break
+
 		ppt.gatherNN()
 		ppt.findAvgWeights()
 		ppt.avgWeightsNN()
+
 		if rank == 0 :
 			ppt.nnFromXML()
 
-	endTime = time.time()		
-	print "\n Neural network training completed in : ", str(endTime - startTime) , " seconds."
+	# comm.MPI_finalize()
+	endTime = time.time()
+	if rank == 0 :		
+		print "\n Neural network training completed in : ", str(endTime - startTime) , " seconds."
+	
 
 
 
